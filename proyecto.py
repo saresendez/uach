@@ -6,6 +6,9 @@ import base64
 import requests
 import email.utils
 import pandas as pd
+import sys
+import html
+from datetime import datetime
 
 # Detección dinámica de entorno (Google Colab vs. GitHub Codespaces / Local PC)
 try:
@@ -36,8 +39,6 @@ MODELO_IA = "gemini-2.5-flash"
 if IN_COLAB:
     BASE_DIR = "/content/drive/MyDrive/Proyecto"
 else:
-    # En GitHub Codespaces, busca una carpeta llamada 'Proyecto' en tu repositorio.
-    # Si no existe, trabajará directamente sobre la carpeta raíz de tu espacio de trabajo.
     posible_directorio = os.path.join(os.getcwd(), "Proyecto")
     if os.path.exists(posible_directorio):
         BASE_DIR = posible_directorio
@@ -62,7 +63,6 @@ try:
     if IN_COLAB:
         API_KEY = userdata.get('GEMINI_API_KEY')
     else:
-        # En Codespaces lee la variable de entorno del sistema
         API_KEY = os.environ.get('GEMINI_API_KEY')
 
     if not API_KEY:
@@ -70,11 +70,9 @@ try:
     print(f"✅ API Key de Gemini recuperada. Usando: {MODELO_IA}")
 except Exception as e:
     print(f"⚠️ Error de configuración de API Key: {e}")
-    if not IN_COLAB:
-        print("💡 Tip para Codespaces: Configura tu API Key ejecutando en la terminal: export GEMINI_API_KEY='tu_clave_aqui'")
 
 def normalizar_id_cliente(valor):
-    """Normaliza IDs de cliente para evitar discrepancies de tipos de datos (ej. 102 vs 102.0)."""
+    """Normaliza IDs de cliente para evitar discrepancias de tipos de datos (ej. 102 vs 102.0)."""
     if pd.isna(valor):
         return ""
     val_str = str(valor).strip().upper()
@@ -90,8 +88,13 @@ def obtener_servicio_gmail():
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"⚠️ No se pudo refrescar el token anterior ({e}). Iniciando autenticación desde cero...")
+                creds = None
+        
+        if not creds:
             if not os.path.exists(RUTA_CREDENTIALS):
                 raise FileNotFoundError(f"❌ No se encontró el archivo credentials.json en: {RUTA_CREDENTIALS}")
 
@@ -177,7 +180,7 @@ def extraer_cuerpo_texto(payload):
             try:
                 html_raw = base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
                 texto = re.sub(r'<[^>]+>', ' ', html_raw)
-                texto = texto.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&gt;', '>')
+                texto = html.unescape(texto)
             except Exception:
                 pass
 
@@ -196,14 +199,34 @@ def buscar_palabras_clave(asunto, cuerpo):
     return any(palabra in texto_completo for palabra in PALABRAS_CLAVE_PAGO)
 
 def detectar_mes_en_texto(asunto, cuerpo):
-    """Escanea el asunto y el cuerpo del correo buscando menciones de algún mes, ignorando puntuación."""
-    texto_completo = f" {asunto} {cuerpo} ".upper()
-    texto_limpio = re.sub(r'[.,;:()\-_\t/]', ' ', texto_completo)
-
+    """
+    Escanea asunto y cuerpo buscando menciones de meses de forma robusta.
+    Evita falsos positivos por orden alfabético/de lista y prioriza el Asunto.
+    """
+    # 1. Intentar buscar en el Asunto (alta prioridad)
+    asunto_limpio = re.sub(r'[.,;:()\-_\t/]', ' ', f" {asunto} ".upper())
+    encontrados_asunto = []
     for mes in MESES:
-        patron = r'\b' + mes + r'\b'
-        if re.search(patron, texto_limpio):
-            return mes
+        match = re.search(r'\b' + mes + r'\b', asunto_limpio)
+        if match:
+            encontrados_asunto.append((match.start(), mes))
+    
+    if encontrados_asunto:
+        encontrados_asunto.sort() # Ordenar por posición física en la cadena
+        return encontrados_asunto[0][1]
+
+    # 2. Intentar buscar en el Cuerpo
+    cuerpo_limpio = re.sub(r'[.,;:()\-_\t/]', ' ', f" {cuerpo} ".upper())
+    encontrados_cuerpo = []
+    for mes in MESES:
+        match = re.search(r'\b' + mes + r'\b', cuerpo_limpio)
+        if match:
+            encontrados_cuerpo.append((match.start(), mes))
+
+    if encontrados_cuerpo:
+        encontrados_cuerpo.sort()
+        return encontrados_cuerpo[0][1]
+
     return None
 
 def detectar_mes_en_hilo(servicio, thread_id):
@@ -253,29 +276,41 @@ def obtener_adjuntos_recursivo(parte):
     return adjuntos
 
 def extraer_metadatos_con_gemini(contenido_binario, mime_type):
-    """Llama a la API de Gemini con Exponential Backoff robusto tolerante a cuotas (429) y saturación (503)."""
+    """Llama a la API de Gemini usando Schema Enforcement para asegurar un JSON válido nativo."""
     if not API_KEY:
         print("   ❌ Error: No se puede llamar a Gemini porque falta la API Key.")
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELO_IA}:generateContent?key={API_KEY}"
     archivo_base64 = base64.b64encode(contenido_binario).decode('utf-8')
+    
     system_prompt = (
         "Actúa como un extractor de metadatos estructurados especializado en recibos de pago. "
-        "Analiza el archivo adjunto y extrae: "
-        "1. La fecha del pago (en formato string 'DD/MM/YYYY'). Ten en cuenta que los recibos "
-        "provienen de México, por lo que las fechas estarán escritas en formatos comunes de español de México. "
-        "Convierte siempre la fecha identificada estrictamente al formato 'DD/MM/YYYY'. "
-        "2. El monto total pagado como número flotante sin símbolos de moneda. "
-        "Responde ÚNICAMENTE con este JSON exacto: "
-        '{"fecha": "DD/MM/YYYY", "monto": 0.0}'
+        "Analiza el archivo adjunto y extrae la fecha del pago y el monto total."
     )
+    
     payload = {
         "contents": [{"parts": [
             {"text": system_prompt},
             {"inlineData": {"mimeType": mime_type, "data": archivo_base64}}
         ]}],
-        "generationConfig": {"responseMimeType": "application/json"}
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "fecha": {
+                        "type": "STRING",
+                        "description": "Fecha del pago extraída del recibo, convertida estrictamente al formato DD/MM/YYYY."
+                    },
+                    "monto": {
+                        "type": "NUMBER",
+                        "description": "Monto total pagado como número flotante sin símbolos de moneda."
+                    }
+                },
+                "required": ["fecha", "monto"]
+            }
+        }
     }
 
     delays = [2, 4, 8, 16, 32]
@@ -289,208 +324,50 @@ def extraer_metadatos_con_gemini(contenido_binario, mime_type):
                 success = True
                 break
             elif response.status_code == 429:
-                try:
-                    err_payload = response.json()
-                    err_msg = err_payload.get('error', {}).get('message', 'Sin detalles adicionales.')
-                except Exception:
-                    err_msg = response.text or 'No se pudo decodificar la respuesta.'
-
-                print(f"   ⏳ [Intento {i+1}/{len(delays)}] Límite de velocidad/Cuota de Gemini excedida (429).")
-                print(f"      📝 Detalle de Google: {err_msg}")
-                print(f"      Esperando {delay}s antes de reintentar...")
+                print(f"   ⏳ [Intento {i+1}/{len(delays)}] Cuota de Gemini excedida (429). Esperando {delay}s...")
             elif response.status_code == 503:
-                print(f"   ⏳ [Intento {i+1}/{len(delays)}] El servidor de Google está saturado (503). Esperando {delay}s antes de reintentar...")
+                print(f"   ⏳ [Intento {i+1}/{len(delays)}] Servidor saturado (503). Esperando {delay}s...")
             else:
-                print(f"   ⚠️ [Intento {i+1}/{len(delays)}] Error de API inesperado (Código {response.status_code}). Esperando {delay}s...")
+                print(f"   ⚠️ [Intento {i+1}/{len(delays)}] Error de API inesperado ({response.status_code}). Esperando {delay}s...")
         except Exception as e:
-            print(f"   ⚠️ Error de conexión: {e}. Esperando {delay}s para reintentar...")
+            print(f"   ⚠️ Error de conexión: {e}. Esperando {delay}s...")
         time.sleep(delay)
 
     if not success:
-        if response is not None:
-            if response.status_code == 429:
-                print(f"   ❌ Se agotaron los reintentos. La cuota gratuita de tu API Key de Gemini se ha superado (Límite RPM/TPD). Por favor, espera un minuto o considera utilizar una clave con cuota comercial.")
-            else:
-                print(f"   ❌ El servidor de Gemini rechazó la solicitud persistentemente (Código {response.status_code}).")
-        else:
-            print("   ❌ No se pudo establecer comunicación con la API de Gemini.")
         return None
 
     try:
+        # Al usar responseSchema, la respuesta es garantizada de ser JSON puro directo
         raw_text = response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-
-        if raw_text.startswith("```"):
-            lineas = raw_text.splitlines()
-            if len(lineas) >= 2:
-                raw_text = "\n".join(lineas[1:-1]).strip()
-            else:
-                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-
         return json.loads(raw_text)
     except Exception as e:
-        print(f"   ❌ Error procesando la respuesta de la Inteligencia Artificial: {e}")
+        print(f"   ❌ Error procesando la respuesta de Gemini: {e}")
         return None
 
-def procesar_correos_inteligente():
-    """Busca correos no conciliados y aplica la cascada de resolución de prioridades."""
-    if not os.path.exists(ARCHIVO_MAPEO):
-        print(f"❌ Error crítico: No se encontró el archivo de mapeo en {ARCHIVO_MAPEO}")
-        return []
-
-    try:
-        print("📖 Cargando archivo de mapeo de identidad...")
-        df_mapeo = pd.read_excel(ARCHIVO_MAPEO)
-        for col in df_mapeo.columns:
-            df_mapeo[col] = df_mapeo[col].astype(str).str.strip()
-
-        columna_email = None
-        for col in df_mapeo.columns:
-            if df_mapeo[col].str.contains('@', na=False).any():
-                columna_email = col
-                break
-
-        if columna_email is None:
-            columna_email = df_mapeo.columns[3] if len(df_mapeo.columns) > 3 else df_mapeo.columns[-1]
-
-        columna_id = df_mapeo.columns[0]
-        df_mapeo[columna_id] = df_mapeo[columna_id].apply(normalizar_id_cliente)
-        df_mapeo[columna_email] = df_mapeo[columna_email].str.lower()
-        print(f"   ℹ️ Columnas de mapeo cargadas: ID -> '{columna_id}', Email -> '{columna_email}'")
-    except Exception as e:
-        print(f"❌ Error al leer mapeo_identidad.xlsx: {e}")
-        return []
-
-    transacciones_a_procesar = []
-
-    try:
-        servicio = obtener_servicio_gmail()
-        label_id = obtener_o_crear_etiqueta(servicio, ETIQUETA_CONTROL)
-
-        query = f'has:attachment -label:{ETIQUETA_CONTROL}'
-        print(f"🔍 Escaneando Gmail para nuevos comprobantes: {query}")
-
-        resultado_busqueda = servicio.users().messages().list(userId='me', q=query).execute()
-        mensajes = resultado_busqueda.get('messages', [])
-
-        if not mensajes:
-            print("📩 No se encontraron nuevos correos con archivos adjuntos pendientes.")
-            return []
-
-        print(f"📩 Se detectaron {len(mensajes)} correos con adjuntos para inspeccionar.")
-
-        for msg_info in mensajes:
-            msg_id = msg_info['id']
-            msg = servicio.users().messages().get(userId='me', id=msg_id).execute()
-            thread_id = msg.get('threadId')
-            payload = msg.get('payload', {})
-
-            headers = payload.get('headers', [])
-            from_header = next((h.get('value', '') for h in headers if h.get('name', '').lower() == 'from'), "")
-            realname, email_remitente = email.utils.parseaddr(from_header)
-            email_remitente = email_remitente.strip().lower()
-
-            match_cliente = df_mapeo[df_mapeo[columna_email] == email_remitente]
-            if match_cliente.empty:
-                continue
-
-            client_id = match_cliente.iloc[0][columna_id]
-
-            asunto_correo = next((h.get('value', '') for h in headers if h.get('name', '').lower() == 'subject'), "Sin Asunto")
-            cuerpo_correo = extraer_cuerpo_texto(payload)
-
-            if not buscar_palabras_clave(asunto_correo, cuerpo_correo):
-                continue
-
-            print(f"\n────────────────────────────────────────────────────────")
-            print(f"👤 Remitente: {email_remitente} (Cliente: {client_id})")
-            print(f"📧 Asunto: {asunto_correo}")
-
-            mes_pago = detectar_mes_en_texto(asunto_correo, cuerpo_correo)
-
-            if not mes_pago and thread_id:
-                print(f"🔍 Mes no detectado en correo actual. Escaneando hilo de conversación...")
-                mes_pago = detectar_mes_en_hilo(servicio, thread_id)
-                if mes_pago:
-                    print(f"💬 Mes hallado en el historial de conversación: {mes_pago}")
-
-            adjuntos = obtener_adjuntos_recursivo(payload)
-            for part in adjuntos:
-                nombre_archivo = part.get('filename')
-                if nombre_archivo:
-                    ext = os.path.splitext(nombre_archivo)[1].lower()
-                    mime_type = None
-                    if ext in ['.jpg', '.jpeg']: mime_type = "image/jpeg"
-                    elif ext == '.png': mime_type = "image/png"
-                    elif ext == '.pdf': mime_type = "application/pdf"
-
-                    if mime_type:
-                        print(f"   📎 Procesando adjunto: {nombre_archivo}")
-                        body = part.get('body', {})
-                        attachment_id = body.get('attachmentId')
-
-                        if attachment_id:
-                            adjunto_raw = servicio.users().messages().attachments().get(
-                                userId='me', messageId=msg_id, id=attachment_id).execute()
-
-                            datos_bytes = base64.urlsafe_b64decode(adjunto_raw['data'].encode('UTF-8'))
-
-                            resultado = extraer_metadatos_con_gemini(datos_bytes, mime_type)
-                            if resultado and resultado.get('monto') is not None:
-                                monto = float(resultado['monto'])
-                                fecha_recibo = resultado.get('fecha', '')
-                                print(f"      ✨ Extraído -> Fecha Recibo: {fecha_recibo} | Monto: ${monto:.2f}")
-
-                                mes_final = mes_pago
-                                if not mes_final:
-                                    mes_final = obtener_mes_desde_fecha(fecha_recibo)
-                                    if mes_final:
-                                        print(f"      📄 Mes determinado por fecha del recibo: {mes_final}")
-
-                                if not mes_final:
-                                    print(f"      ❓ No se pudo identificar el mes automáticamente.")
-                                    while True:
-                                        entrada = input(f"      👉 Introduce el mes para este pago (ej. MARZO) o ENTER para omitir: ").strip().upper()
-                                        if not entrada:
-                                            print("      ⏭️ Correo omitido por el usuario.")
-                                            break
-                                        if entrada in MESES:
-                                            mes_final = entrada
-                                            break
-                                        else:
-                                            print(f"      ⚠️ '{entrada}' no es un mes válido. Inténtalo de nuevo.")
-
-                                if mes_final:
-                                    transacciones_a_procesar.append({
-                                        "client_id": client_id,
-                                        "mes": mes_final,
-                                        "monto": monto,
-                                        "msg_id": msg_id,
-                                        "label_id": label_id,
-                                        "remitente": email_remitente
-                                    })
-                            else:
-                                print(f"      ⚠️ No se pudo extraer información estructurada del adjunto.")
-
-    except Exception as e:
-        print(f"❌ Error crítico en la API de Gmail: {e}")
-
-    return transacciones_a_procesar
-
-def actualizar_excel(id_cliente, mes_pago, monto_pago):
+def actualizar_excel(id_cliente, id_real, mes_pago, monto_pago):
     """
-    Registra el pago en el Excel reg_anon.xlsx y realiza un cruce de identidad
-    usando mapeo_identidad.xlsx para registrar el pago idéntico en registros.xlsx.
+    Registra el pago en reg_anon.xlsx y de forma sincronizada en registros.xlsx.
+    Optimizado para evitar lecturas de mapeo reiteradas e incluye tolerancia a bloqueos de archivos abiertos.
     """
     try:
         # -------------------------------------------------------------
         # PARTE 1: ACTUALIZACIÓN EN reg_anon.xlsx
         # -------------------------------------------------------------
-        wb = openpyxl.load_workbook(ARCHIVO_EXCEL)
+        if not os.path.exists(ARCHIVO_EXCEL):
+            print(f"❌ Error: El archivo {ARCHIVO_EXCEL} no existe.")
+            return False
+
+        try:
+            wb = openpyxl.load_workbook(ARCHIVO_EXCEL)
+        except PermissionError:
+            print(f"❌ Error de permisos: No se puede abrir '{ARCHIVO_EXCEL}'. Asegúrate de cerrarlo en Excel.")
+            return False
+
         ws = wb.active
 
         encabezados = [str(ws.cell(row=1, column=col).value).strip().upper() for col in range(1, ws.max_column + 1)]
-
         id_cliente_normalizado = normalizar_id_cliente(id_cliente)
+        
         fila_cliente = None
         for row in range(2, ws.max_row + 1):
             val_celda = normalizar_id_cliente(ws.cell(row=row, column=1).value)
@@ -552,34 +429,31 @@ def actualizar_excel(id_cliente, mes_pago, monto_pago):
             print(f"🔄 El mes {mes_pago_upper} ya estaba liquidado. Redireccionando pago a {mes_destino_final}...")
             fuente_especial = Font(name='Arial', size=11, bold=True, italic=True, color='008000')
             celda_objetivo.font = fuente_especial
-            print(f"   🎨 Aplicado formato visual especial (Negrita, Cursiva, Color Verde) a la celda en reg_anon.xlsx.")
         else:
             celda_objetivo.font = Font(name='Arial', size=11, bold=False, italic=False, color='000000')
 
-        wb.save(ARCHIVO_EXCEL)
+        try:
+            wb.save(ARCHIVO_EXCEL)
+        except PermissionError:
+            print(f"❌ Error de escritura: No se puede guardar '{ARCHIVO_EXCEL}'. Asegúrate de cerrarlo en Excel.")
+            wb.close()
+            return False
+        
         wb.close()
-        print(f"✅ Registrado exitosamente en reg_anon.xlsx para {id_cliente_normalizado} en {mes_destino_final}: ${nuevo_monto_total:.2f}")
+        print(f"✅ Registrado en reg_anon.xlsx para {id_cliente_normalizado} en {mes_destino_final}: ${nuevo_monto_total:.2f}")
 
         # -------------------------------------------------------------
         # PARTE 2: SINCRONIZACIÓN EN registros.xlsx
         # -------------------------------------------------------------
-        id_real = None
-        try:
-            df_mapeo = pd.read_excel(ARCHIVO_MAPEO)
-            df_mapeo.iloc[:, 0] = df_mapeo.iloc[:, 0].apply(normalizar_id_cliente)
-            match_map = df_mapeo[df_mapeo.iloc[:, 0] == id_cliente_normalizado]
-            if not match_map.empty:
-                id_real = str(match_map.iloc[0, 1]).strip().upper()
-                if id_real.endswith('.0'):
-                    id_real = id_real[:-2]
-        except Exception as e:
-            print(f"⚠️ No se pudo consultar mapeo_identidad.xlsx para obtener el ID real: {e}")
-
         if id_real and os.path.exists(ARCHIVO_REGISTROS):
             try:
-                wb_reg = openpyxl.load_workbook(ARCHIVO_REGISTROS)
-                ws_reg = wb_reg.active
+                try:
+                    wb_reg = openpyxl.load_workbook(ARCHIVO_REGISTROS)
+                except PermissionError:
+                    print(f"❌ Error de permisos: No se puede abrir '{ARCHIVO_REGISTROS}'. Asegúrate de cerrarlo en Excel.")
+                    return False
 
+                ws_reg = wb_reg.active
                 encabezados_reg = [str(ws_reg.cell(row=1, column=col).value).strip().upper() for col in range(1, ws_reg.max_column + 1)]
 
                 fila_real = None
@@ -609,8 +483,13 @@ def actualizar_excel(id_cliente, mes_pago, monto_pago):
                     else:
                         celda_reg.font = Font(name='Arial', size=11, bold=False, italic=False, color='000000')
 
-                    wb_reg.save(ARCHIVO_REGISTROS)
-                    print(f"✅ Sincronizado exitosamente en registros.xlsx para el ID Real '{id_real}' en {mes_destino_final}: ${nuevo_monto_reg:.2f}")
+                    try:
+                        wb_reg.save(ARCHIVO_REGISTROS)
+                        print(f"✅ Sincronizado en registros.xlsx para ID Real '{id_real}' en {mes_destino_final}: ${nuevo_monto_reg:.2f}")
+                    except PermissionError:
+                        print(f"❌ Error de escritura: No se puede guardar '{ARCHIVO_REGISTROS}'. Asegúrate de cerrarlo.")
+                        wb_reg.close()
+                        return False
                 else:
                     if not fila_real:
                         print(f"⚠️ Advertencia: No se encontró la fila para el ID real '{id_real}' en registros.xlsx.")
@@ -620,6 +499,7 @@ def actualizar_excel(id_cliente, mes_pago, monto_pago):
                 wb_reg.close()
             except Exception as e:
                 print(f"❌ Error al intentar escribir en registros.xlsx: {e}")
+                return False
         else:
             if not id_real:
                 print(f"⚠️ No se encontró ID real en el mapa de identidad para el cliente {id_cliente_normalizado}.")
@@ -631,6 +511,182 @@ def actualizar_excel(id_cliente, mes_pago, monto_pago):
         print(f"❌ Error crítico en el guardado transaccional de datos: {e}")
         return False
 
+def procesar_y_conciliar_correos():
+    """
+    Escanea Gmail, procesa cada correo de forma transaccional, actualiza Excel
+    y etiqueta el correo como CONCILIADO de inmediato si todas las operaciones del mismo tienen éxito.
+    """
+    if not os.path.exists(ARCHIVO_MAPEO):
+        print(f"❌ Error crítico: No se encontró el archivo de mapeo en {ARCHIVO_MAPEO}")
+        return
+
+    try:
+        print("📖 Cargando archivo de mapeo de identidad...")
+        df_mapeo = pd.read_excel(ARCHIVO_MAPEO)
+        for col in df_mapeo.columns:
+            df_mapeo[col] = df_mapeo[col].astype(str).str.strip()
+
+        columna_email = None
+        for col in df_mapeo.columns:
+            if df_mapeo[col].astype(str).str.contains('@', na=False).any():
+                columna_email = col
+                break
+
+        if columna_email is None:
+            columna_email = df_mapeo.columns[3] if len(df_mapeo.columns) > 3 else df_mapeo.columns[-1]
+
+        columna_id = df_mapeo.columns[0]
+        df_mapeo[columna_id] = df_mapeo[columna_id].apply(normalizar_id_cliente)
+        df_mapeo[columna_email] = df_mapeo[columna_email].str.lower()
+        print(f"   ℹ️ Columnas de mapeo cargadas: ID -> '{columna_id}', Email -> '{columna_email}'")
+    except Exception as e:
+        print(f"❌ Error al leer mapeo_identidad.xlsx: {e}")
+        return
+
+    try:
+        servicio = obtener_servicio_gmail()
+        label_id = obtener_o_crear_etiqueta(servicio, ETIQUETA_CONTROL)
+
+        query = f'has:attachment -label:{ETIQUETA_CONTROL}'
+        print(f"🔍 Escaneando Gmail para nuevos comprobantes: {query}")
+
+        resultado_busqueda = servicio.users().messages().list(userId='me', q=query).execute()
+        mensajes = resultado_busqueda.get('messages', [])
+
+        if not mensajes:
+            print("📩 No se encontraron nuevos correos con archivos adjuntos pendientes.")
+            return
+
+        print(f"📩 Se detectaron {len(mensajes)} correos con adjuntos para inspeccionar.")
+
+        for msg_info in mensajes:
+            msg_id = msg_info['id']
+            msg = servicio.users().messages().get(userId='me', id=msg_id).execute()
+            thread_id = msg.get('threadId')
+            payload = msg.get('payload', {})
+
+            headers = payload.get('headers', [])
+            from_header = next((h.get('value', '') for h in headers if h.get('name', '').lower() == 'from'), "")
+            realname, email_remitente = email.utils.parseaddr(from_header)
+            email_remitente = email_remitente.strip().lower()
+
+            match_cliente = df_mapeo[df_mapeo[columna_email] == email_remitente]
+            if match_cliente.empty:
+                print(f"⚠️ Correo {msg_id} de {email_remitente} omitido: No registrado en el mapa de identidad.")
+                continue
+
+            client_id = match_cliente.iloc[0][columna_id]
+            
+            # Obtener ID real directamente de la segunda columna del mapeo y evitar leer el Excel otra vez
+            id_real = str(match_cliente.iloc[0, 1]).strip().upper()
+            if id_real.endswith('.0'):
+                id_real = id_real[:-2]
+
+            asunto_correo = next((h.get('value', '') for h in headers if h.get('name', '').lower() == 'subject'), "Sin Asunto")
+            cuerpo_correo = extraer_cuerpo_texto(payload)
+
+            if not buscar_palabras_clave(asunto_correo, cuerpo_correo):
+                continue
+
+            print(f"\n────────────────────────────────────────────────────────")
+            print(f"👤 Remitente: {email_remitente} (Cliente ID: {client_id} | Real ID: {id_real})")
+            print(f"📧 Asunto: {asunto_correo}")
+
+            mes_pago = detectar_mes_en_texto(asunto_correo, cuerpo_correo)
+
+            if not mes_pago and thread_id:
+                print(f"🔍 Mes no detectado en correo actual. Escaneando hilo de conversación...")
+                mes_pago = detectar_mes_en_hilo(servicio, thread_id)
+                if mes_pago:
+                    print(f"💬 Mes hallado en el historial de conversación: {mes_pago}")
+
+            adjuntos = obtener_adjuntos_recursivo(payload)
+            
+            # Procesar transaccionalmente este correo electrónico
+            todo_exitoso = True
+            adjuntos_validos = 0
+            
+            for part in adjuntos:
+                nombre_archivo = part.get('filename')
+                if nombre_archivo:
+                    ext = os.path.splitext(nombre_archivo)[1].lower()
+                    mime_type = None
+                    if ext in ['.jpg', '.jpeg']: mime_type = "image/jpeg"
+                    elif ext == '.png': mime_type = "image/png"
+                    elif ext == '.pdf': mime_type = "application/pdf"
+
+                    if mime_type:
+                        adjuntos_validos += 1
+                        print(f"   📎 Procesando adjunto: {nombre_archivo}")
+                        body = part.get('body', {})
+                        attachment_id = body.get('attachmentId')
+
+                        if attachment_id:
+                            adjunto_raw = servicio.users().messages().attachments().get(
+                                userId='me', messageId=msg_id, id=attachment_id).execute()
+
+                            datos_bytes = base64.urlsafe_b64decode(adjunto_raw['data'].encode('UTF-8'))
+
+                            resultado = extraer_metadatos_con_gemini(datos_bytes, mime_type)
+                            if resultado and resultado.get('monto') is not None:
+                                monto = float(resultado['monto'])
+                                
+                                # Evitar registrar valores nulos o negativos que no sean pagos reales
+                                if monto <= 0:
+                                    print(f"      ⚠️ Monto detectado menor o igual a cero (${monto:.2f}). Se omite este adjunto.")
+                                    continue
+                                
+                                fecha_recibo = resultado.get('fecha', '')
+                                print(f"      ✨ Extraído -> Fecha Recibo: {fecha_recibo} | Monto: ${monto:.2f}")
+
+                                mes_final = mes_pago
+                                if not mes_final:
+                                    mes_final = obtener_mes_desde_fecha(fecha_recibo)
+                                    if mes_final:
+                                        print(f"      📄 Mes determinado por fecha del recibo: {mes_final}")
+
+                                if not mes_final:
+                                    if sys.stdin.isatty():
+                                        print(f"      ❓ No se pudo identificar el mes automáticamente.")
+                                        while True:
+                                            entrada = input(f"      👉 Introduce el mes para este pago (ej. MARZO) o ENTER para omitir: ").strip().upper()
+                                            if not entrada:
+                                                print("      ⏭️ Correo omitido por el usuario.")
+                                                break
+                                            if entrada in MESES:
+                                                mes_final = entrada
+                                                break
+                                            else:
+                                                print(f"      ⚠️ '{entrada}' no es un mes válido. Inténtalo de nuevo.")
+                                    else:
+                                        # Fallback automático y no bloqueante si corre en servidor sin terminal interactiva
+                                        mes_actual_idx = datetime.now().month
+                                        mes_final = MESES[mes_actual_idx - 1]
+                                        print(f"      📅 Entorno no interactivo. Usando mes actual del sistema: {mes_final}")
+
+                                if mes_final:
+                                    # Intentar registrar en Excel de inmediato
+                                    escritura_ok = actualizar_excel(client_id, id_real, mes_final, monto)
+                                    if not escritura_ok:
+                                        todo_exitoso = False
+                                        print(f"      ❌ Error al actualizar bases de datos para el adjunto: {nombre_archivo}")
+                                else:
+                                    todo_exitoso = False
+                            else:
+                                print(f"      ⚠️ No se pudo extraer información estructurada del adjunto.")
+                                todo_exitoso = False
+
+            # Solo marcar el correo como conciliado si hubo adjuntos válidos procesados y no hubo ningún fallo
+            if todo_exitoso and adjuntos_validos > 0:
+                aplicar_etiqueta_procesado(servicio, msg_id, label_id)
+            elif adjuntos_validos == 0:
+                print("   ⚠️ El correo no contenía adjuntos compatibles (JPG, PNG o PDF).")
+            else:
+                print(f"   ⚠️ Se omitió el etiquetado del correo {msg_id} debido a un error durante el flujo de registro.")
+
+    except Exception as e:
+        print(f"❌ Error crítico en la API de Gmail: {e}")
+
 if __name__ == "__main__":
     print("=== SISTEMA INTELIGENTE DE CONCILIACIÓN INSTITUCIONAL ===")
 
@@ -640,18 +696,6 @@ if __name__ == "__main__":
             from google.colab import drive
             drive.mount('/content/drive')
     else:
-        print(f"💻 Ejecutando en entorno local (GitHub Codespaces / PC). Carpeta raíz: {BASE_DIR}")
+        print(f"💻 Ejecutando en entorno local. Carpeta raíz: {BASE_DIR}")
 
-    transacciones = procesar_correos_inteligente()
-
-    if transacciones:
-        print("\n=== INICIANDO ACTUALIZACIÓN DE REGISTROS ===")
-        servicio_gmail = obtener_servicio_gmail()
-
-        for tx in transacciones:
-            if actualizar_excel(tx["client_id"], tx["mes"], tx["monto"]):
-                aplicar_etiqueta_procesado(servicio_gmail, tx["msg_id"], tx["label_id"])
-            else:
-                print(f"⚠️ Se omitió el etiquetado del correo {tx['msg_id']} debido a un error al guardar en Excel.")
-    else:
-        print("\n❌ No se detectaron nuevos comprobantes para procesar.")
+    procesar_y_conciliar_correos()
