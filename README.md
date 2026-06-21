@@ -15,50 +15,11 @@ Resiliencia ante Límites de API (Rate-Limiting): Implementa un algoritmo matem�
 
 Despliegue Desatendido 24/7: Configurado para ejecutarse de manera autónoma en un VPS Linux (Ubuntu) a través de tareas programadas (cron), con un sistema robusto de auditoría de logs.
 
-                +----------------------------------------+
-               |  Gmail: Escaneo inteligente de Inbox   |
-               |  (Filtros: Attachments & Keywords)     |
-               +----------------------------------------+
-                                   |
-                                   v
-               +----------------------------------------+
-               | Tokenizador Local: Mapeo de Identidad  |  <-- Resguarda Datos
-               | (Cruce de correo -> ID_Cliente)        |      Sensibles
-               +----------------------------------------+
-                                   |
-                                   v
-               +----------------------------------------+
-               |  API Gemini: Extracción Semántica     |  <-- Solo procesa
-               |  (Monto neto, Fecha del Recibo)        |      el binario anónimo
-               +----------------------------------------+
-                                   |
-                                   v
-               +----------------------------------------+
-               |  Motor Contable: Cascada de Meses      |
-               |  & Aplicación de Formatos en Caliente  |
-               +----------------------------------------+
-                                   |
-               +-------------------+--------------------+
-               |                                        |
-               v                                        v
-+-----------------------------+          +-----------------------------+
-| Actualiza: reg_anon.xlsx    |          | Actualiza: registros.xlsx   |
-| (ID Anónimo de Control)     |          | (ID Real del Alumno)        |
-+-----------------------------+          +-----------------------------+
-               |                                        |
-               +-------------------+--------------------+
-                                   |
-                                   v
-               +----------------------------------------+
-               |   Google Drive: Sincronización Remota  |
-               |   y Etiquetado del correo procesado    |
-               +----------------------------------------+
-
 -Requisitos e Instalación
 
 -Requisitos Previos
 
-Servidor VPS Linux( sitema basado en Debian recomendado) o entorno local con Python 3.10+.
+Servidor VPS Linux(Ubuntu o un sitema basado en Debian recomendado) o entorno local con Python 3.10+.
 Cuenta en Google Cloud Console con las APIs de Gmail y Google Drive habilitadas.
 Archivo credentials.json generado desde la pantalla de consentimiento de OAuth de Google.
 Una API Key válida de Google AI Studio (Gemini API).
