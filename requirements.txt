@@ -1,14 +1,6 @@
-STREAMING_CHUNK: Definiendo librerías oficiales de Google API...
-
 google-api-python-client>=2.100.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
-
-STREAMING_CHUNK: Definiendo librerías para análisis de datos y manipulación de Excel...
-
 pandas>=2.0.0
 openpyxl>=3.1.0
-
-STREAMING_CHUNK: Definiendo librerías para peticiones HTTP (Gemini API)...
-
 requests>=2.31.0
