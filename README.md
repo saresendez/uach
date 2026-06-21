@@ -15,9 +15,7 @@ Resiliencia ante Límites de API (Rate-Limiting): Implementa un algoritmo matem�
 
 Despliegue Desatendido 24/7: Configurado para ejecutarse de manera autónoma en un VPS Linux (Ubuntu) a través de tareas programadas (cron), con un sistema robusto de auditoría de logs.
 
- 
-
-               +----------------------------------------+
+                +----------------------------------------+
                |  Gmail: Escaneo inteligente de Inbox   |
                |  (Filtros: Attachments & Keywords)     |
                +----------------------------------------+
@@ -55,6 +53,7 @@ Despliegue Desatendido 24/7: Configurado para ejecutarse de manera autónoma en 
                |   Google Drive: Sincronización Remota  |
                |   y Etiquetado del correo procesado    |
                +----------------------------------------+
+
 -Requisitos e Instalación
 
 -Requisitos Previos
