@@ -71,3 +71,4 @@ Puedes revisar el desempeño del conciliador y el resultado de las extracciones 
 ___________________________________________
 tail -f /home/conciliador/conciliacion.log
 ___________________________________________
+El Archivo "prompt maestro.md" contiene la informacion para la creacion del script en python. 
